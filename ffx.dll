@@ -1,0 +1,375 @@
+using Dalamud.Data;
+using Dalamud.Game.Command;
+using Dalamud.Game.Gui;
+using Dalamud.Game.Network;
+using Dalamud.Game.Network.Structures;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Text.SeStringHandling.Payloads;
+using Dalamud.Interface;
+using Dalamud.IoC;
+using Dalamud.Plugin;
+using Lumina.Excel.GeneratedSheets;
+using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace CraftingOptimizer
+{
+    public class CraftingOptimizer : IDalamudPlugin
+    {
+        public string Name => "Crafting Optimizer";
+
+        private DalamudPluginInterface PluginInterface { get; init; }
+        private CommandManager CommandManager { get; init; }
+        private DataManager GameData { get; init; }
+        private ChatGui ChatGui { get; init; }
+        private ClientNetwork ClientNetwork { get; init; }
+        private readonly HttpClient _httpClient;
+        private readonly ConcurrentDictionary<int, CraftableItem> _craftableItemsCache = new ConcurrentDictionary<int, CraftableItem>();
+        private readonly ConcurrentDictionary<int, uint> _marketPricesCache = new ConcurrentDictionary<int, uint>();
+
+        public CraftingOptimizer(DalamudPluginInterface pluginInterface, CommandManager commandManager, DataManager gameData, ChatGui chatGui, ClientNetwork clientNetwork)
+        {
+            PluginInterface = pluginInterface;
+            CommandManager = commandManager;
+            GameData = gameData;
+            ChatGui = chatGui;
+            ClientNetwork = clientNetwork;
+            _httpClient = new HttpClient();
+
+            CommandManager.AddHandler("/craftopt", new CommandInfo(OnCommand)
+            {
+                HelpMessage = "Analyzes inventory and provides crafting recommendations. Usage: /craftopt [page]"
+            });
+
+            ClientNetwork.NetworkMessage += OnNetworkMessage;
+        }
+
+        public void Dispose()
+        {
+            CommandManager.RemoveHandler("/craftopt");
+            ClientNetwork.NetworkMessage -= OnNetworkMessage;
+            _craftableItemsCache.Clear();
+            _marketPricesCache.Clear();
+            _httpClient.Dispose();
+        }
+
+        private void OnCommand(string command, string args)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var inventory = GetInventory();
+                    var retainerInventories = GetRetainerInventories();
+                    var saddlebagContents = GetSaddlebagContents();
+
+                    var allItems = inventory.Concat(retainerInventories).Concat(saddlebagContents).ToList();
+
+                    var craftableItems = GetCraftableItems();
+
+                    var craftableWithMaterials = GetCraftableWithMaterials(allItems, craftableItems);
+
+                    var profitabilityAnalysis = await PerformProfitabilityAnalysis(craftableWithMaterials);
+
+                    var pageNumber = 1;
+                    if (!string.IsNullOrWhiteSpace(args))
+                    {
+                        if (int.TryParse(args, out var page) && page > 0)
+                        {
+                            pageNumber = page;
+                        }
+                    }
+
+                    DisplayResults(profitabilityAnalysis, pageNumber);
+                }
+                catch (Exception ex)
+                {
+                    PluginLog.Error(ex, "An error occurred while running the crafting optimizer.");
+                    ChatGui.PrintError("An unexpected error occurred. Please try again later.");
+                }
+            });
+        }
+
+        private void OnNetworkMessage(IntPtr dataPtr, ushort opCode, uint sourceActorId, uint targetActorId, NetworkMessageDirection direction)
+        {
+            if (opCode == 0x0346) // Market board purchase result
+            {
+                var marketBoardPurchaseResult = MarketBoardPurchaseResult.Read(dataPtr);
+                var itemId = marketBoardPurchaseResult.CatalogId;
+                var pricePerUnit = marketBoardPurchaseResult.PricePerUnit;
+
+                _marketPricesCache.AddOrUpdate(itemId, pricePerUnit, (_, _) => pricePerUnit);
+            }
+        }
+
+        private List<InventoryItem> GetInventory()
+        {
+            var inventory = PluginInterface.Framework.Gui.InventoryManager.GetInventoryItems();
+            return inventory.Select(item => new InventoryItem
+            {
+                ItemId = item.ItemId,
+                Quantity = item.Quantity,
+                LocationId = item.LocationId
+            }).ToList();
+        }
+
+        private List<InventoryItem> GetRetainerInventories()
+        {
+            var retainerInventories = new List<InventoryItem>();
+            var retainerCount = PluginInterface.Framework.Gui.InventoryManager.GetRetainerCount();
+
+            for (int retainerIndex = 0; retainerIndex < retainerCount; retainerIndex++)
+            {
+                var retainerItems = PluginInterface.Framework.Gui.InventoryManager.GetRetainerInventoryItems(retainerIndex);
+                retainerInventories.AddRange(retainerItems.Select(item => new InventoryItem
+                {
+                    ItemId = item.ItemId,
+                    Quantity = item.Quantity,
+                    LocationId = retainerIndex
+                }));
+            }
+
+            return retainerInventories;
+        }
+
+        private List<InventoryItem> GetSaddlebagContents()
+        {
+            var saddlebagItems = PluginInterface.Framework.Gui.InventoryManager.GetSaddlebagItems();
+            return saddlebagItems.Select(item => new InventoryItem
+            {
+                ItemId = item.ItemId,
+                Quantity = item.Quantity,
+                LocationId = -1 // Saddlebag location ID
+            }).ToList();
+        }
+
+        private List<CraftableItem> GetCraftableItems()
+        {
+            if (_craftableItemsCache.Count > 0)
+            {
+                return _craftableItemsCache.Values.ToList();
+            }
+
+            var craftableItems = new List<CraftableItem>();
+
+            var recipeSheet = GameData.GetExcelSheet<Recipe>();
+            if (recipeSheet != null)
+            {
+                foreach (var recipe in recipeSheet)
+                {
+                    var craftableItem = new CraftableItem
+                    {
+                        ItemId = recipe.ItemResult.Value.RowId,
+                        ItemName = recipe.ItemResult.Value.Name,
+                        Materials = new List<Material>()
+                    };
+
+                    for (int i = 0; i < 10; i++)
+                    {
+                        var materialId = recipe.GetMaterial(i).Value?.RowId;
+                        var materialQuantity = recipe.AmountIngredient[i];
+
+                        if (materialId.HasValue && materialQuantity > 0)
+                        {
+                            craftableItem.Materials.Add(new Material
+                            {
+                                ItemId = materialId.Value,
+                                Quantity = materialQuantity
+                            });
+                        }
+                    }
+
+                    _craftableItemsCache.TryAdd(craftableItem.ItemId, craftableItem);
+                    craftableItems.Add(craftableItem);
+                }
+            }
+
+            return craftableItems;
+        }
+
+        private Dictionary<int, CraftableItem> GetCraftableWithMaterials(List<InventoryItem> availableItems, List<CraftableItem> craftableItems)
+        {
+            var materialCounts = new Dictionary<int, int>();
+            foreach (var item in availableItems)
+            {
+                if (!materialCounts.ContainsKey(item.ItemId))
+                {
+                    materialCounts[item.ItemId] = 0;
+                }
+                materialCounts[item.ItemId] += item.Quantity;
+            }
+
+            var craftableWithMaterials = new Dictionary<int, CraftableItem>();
+            foreach (var craftableItem in craftableItems)
+            {
+                bool hasAllMaterials = true;
+                foreach (var material in craftableItem.Materials)
+                {
+                    if (!materialCounts.ContainsKey(material.ItemId) || materialCounts[material.ItemId] < material.Quantity)
+                    {
+                        hasAllMaterials = false;
+                        break;
+                    }
+                }
+
+                if (hasAllMaterials)
+                {
+                    craftableWithMaterials[craftableItem.ItemId] = craftableItem;
+                }
+            }
+
+            return craftableWithMaterials;
+        }
+
+        private async Task<List<CraftingRecommendation>> PerformProfitabilityAnalysis(Dictionary<int, CraftableItem> craftableWithMaterials)
+        {
+            var profitabilityAnalysis = new List<CraftingRecommendation>();
+
+            foreach (var craftableItem in craftableWithMaterials.Values)
+            {
+                var craftedItemPrice = await GetMarketPrice(craftableItem.ItemId);
+                var materialsTotalCost = await Task.WhenAll(craftableItem.Materials.Select(async m => await GetMarketPrice(m.ItemId) * m.Quantity));
+
+                var profitability = craftedItemPrice - materialsTotalCost.Sum();
+
+                profitabilityAnalysis.Add(new CraftingRecommendation
+                {
+                    ItemId = craftableItem.ItemId,
+                    ItemName = craftableItem.ItemName,
+                    Profitability = profitability,
+                    MaterialLocations = GetMaterialLocations(craftableItem.Materials)
+                });
+            }
+
+            return profitabilityAnalysis;
+        }
+
+        private async Task<uint> GetMarketPrice(int itemId)
+        {
+            if (_marketPricesCache.TryGetValue(itemId, out var cachedPrice))
+            {
+                return cachedPrice;
+            }
+
+            try
+            {
+                var response = await _httpClient.GetAsync($"https://universalis.app/api/v2/{PluginInterface.GetClientLanguage()}/{itemId}?entries=1");
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync();
+                var data = JObject.Parse(json);
+
+                var pricePerUnit = data["listings"]?[0]?["pricePerUnit"]?.Value<uint>() ?? 0;
+                _marketPricesCache.TryAdd(itemId, pricePerUnit);
+                return pricePerUnit;
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error(ex, $"Failed to retrieve market price for item {itemId}.");
+                return 0;
+            }
+        }
+
+        private Dictionary<int, List<int>> GetMaterialLocations(List<Material> materials)
+        {
+            var materialLocations = new Dictionary<int, List<int>>();
+
+            foreach (var material in materials)
+            {
+                var locations = GetItemLocations(material.ItemId);
+                materialLocations[material.ItemId] = locations;
+            }
+
+            return materialLocations;
+        }
+
+        private List<int> GetItemLocations(int itemId)
+        {
+            var locations = new List<int>();
+
+            var inventoryItems = GetInventory();
+            var retainerInventoryItems = GetRetainerInventories();
+            var saddlebagItems = GetSaddlebagContents();
+
+            var allItems = inventoryItems.Concat(retainerInventoryItems).Concat(saddlebagItems);
+
+            foreach (var item in allItems)
+            {
+                if (item.ItemId == itemId)
+                {
+                    locations.Add(item.LocationId);
+                }
+            }
+
+            return locations;
+        }
+
+        private void DisplayResults(List<CraftingRecommendation> profitabilityAnalysis, int pageNumber)
+        {
+            const int pageSize = 10;
+            var totalPages = (int)Math.Ceiling((double)profitabilityAnalysis.Count / pageSize);
+            var startIndex = (pageNumber - 1) * pageSize;
+            var endIndex = Math.Min(startIndex + pageSize, profitabilityAnalysis.Count);
+
+            var chatMessage = new SeString();
+            chatMessage.Append(new TextPayload($"Crafting Recommendations (Page {pageNumber}/{totalPages}):\n"));
+
+            var tableHeader = $"{"Item Name",-40} {"Profit",-10} {"Material Locations",-20}\n";
+            tableHeader += $"{"".PadRight(40, '-')} {"".PadRight(10, '-')} {"".PadRight(20, '-')}\n";
+            chatMessage.Append(new TextPayload(tableHeader));
+
+            for (int i = startIndex; i < endIndex; i++)
+            {
+                var recommendation = profitabilityAnalysis[i];
+                var itemName = recommendation.ItemName.PadRight(40);
+                var profitability = recommendation.Profitability.ToString().PadLeft(10);
+                var materialLocations = string.Join(", ", recommendation.MaterialLocations.SelectMany(x => x.Value));
+
+                var profitColor = recommendation.Profitability >= 10000 ? "00ff00" : (recommendation.Profitability >= 5000 ? "ffff00" : "ff0000");
+                var profitText = $"[{profitColor}]{profitability}[-]";
+
+                var rowText = $"{itemName} {profitText} {materialLocations,-20}\n";
+                chatMessage.Append(new TextPayload(rowText));
+            }
+
+            chatMessage.Append(new TextPayload("\nUse /craftopt <page> to view other pages."));
+
+            ChatGui.Print(chatMessage);
+        }
+    }
+
+    public class InventoryItem
+    {
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+        public int LocationId { get; set; }
+    }
+
+    public class CraftableItem
+    {
+        public int ItemId { get; set; }
+        public string ItemName { get; set; }
+        public List<Material> Materials { get; set; }
+    }
+
+    public class Material
+    {
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class CraftingRecommendation
+    {
+        public int ItemId { get; set; }
+        public string ItemName { get; set; }
+        public uint Profitability { get; set; }
+        public Dictionary<int, List<int>> MaterialLocations { get; set; }
+    }
+}
