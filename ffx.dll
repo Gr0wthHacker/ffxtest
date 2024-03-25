@@ -1,3 +1,4 @@
+using Dalamud.Configuration;
 using Dalamud.Data;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui;
@@ -9,11 +10,14 @@ using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Interface;
 using Dalamud.IoC;
 using Dalamud.Plugin;
+using Lumina.Excel;
 using Lumina.Excel.GeneratedSheets;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -30,9 +34,12 @@ namespace CraftingOptimizer
         private DataManager GameData { get; init; }
         private ChatGui ChatGui { get; init; }
         private ClientNetwork ClientNetwork { get; init; }
+        private Configuration PluginConfiguration { get; init; }
         private readonly HttpClient _httpClient;
-        private readonly ConcurrentDictionary<int, CraftableItem> _craftableItemsCache = new ConcurrentDictionary<int, CraftableItem>();
-        private readonly ConcurrentDictionary<int, uint> _marketPricesCache = new ConcurrentDictionary<int, uint>();
+        private readonly ConcurrentDictionary<uint, Item> _itemCache = new ConcurrentDictionary<uint, Item>();
+        private readonly ConcurrentDictionary<uint, Recipe> _recipeCache = new ConcurrentDictionary<uint, Recipe>();
+        private readonly ConcurrentDictionary<uint, uint> _marketPricesCache = new ConcurrentDictionary<uint, uint>();
+        private readonly List<CraftingHistoryEntry> _craftingHistory = new List<CraftingHistoryEntry>();
 
         public CraftingOptimizer(DalamudPluginInterface pluginInterface, CommandManager commandManager, DataManager gameData, ChatGui chatGui, ClientNetwork clientNetwork)
         {
@@ -43,9 +50,32 @@ namespace CraftingOptimizer
             ClientNetwork = clientNetwork;
             _httpClient = new HttpClient();
 
+            PluginConfiguration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+            PluginConfiguration.Initialize(PluginInterface);
+
             CommandManager.AddHandler("/craftopt", new CommandInfo(OnCommand)
             {
                 HelpMessage = "Analyzes inventory and provides crafting recommendations. Usage: /craftopt [page]"
+            });
+
+            CommandManager.AddHandler("/craftopt refresh", new CommandInfo(OnRefreshCommand)
+            {
+                HelpMessage = "Refreshes the craftable items cache and market prices cache."
+            });
+
+            CommandManager.AddHandler("/craftopt export", new CommandInfo(OnExportCommand)
+            {
+                HelpMessage = "Exports the crafting recommendations to a CSV file."
+            });
+
+            CommandManager.AddHandler("/craftopt history", new CommandInfo(OnHistoryCommand)
+            {
+                HelpMessage = "Displays the crafting history and statistics."
+            });
+
+            CommandManager.AddHandler("/craftopt filter", new CommandInfo(OnFilterCommand)
+            {
+                HelpMessage = "Filters the crafting recommendations based on criteria. Usage: /craftopt filter <criteria>"
             });
 
             ClientNetwork.NetworkMessage += OnNetworkMessage;
@@ -54,8 +84,13 @@ namespace CraftingOptimizer
         public void Dispose()
         {
             CommandManager.RemoveHandler("/craftopt");
+            CommandManager.RemoveHandler("/craftopt refresh");
+            CommandManager.RemoveHandler("/craftopt export");
+            CommandManager.RemoveHandler("/craftopt history");
+            CommandManager.RemoveHandler("/craftopt filter");
             ClientNetwork.NetworkMessage -= OnNetworkMessage;
-            _craftableItemsCache.Clear();
+            _itemCache.Clear();
+            _recipeCache.Clear();
             _marketPricesCache.Clear();
             _httpClient.Dispose();
         }
@@ -72,11 +107,13 @@ namespace CraftingOptimizer
 
                     var allItems = inventory.Concat(retainerInventories).Concat(saddlebagContents).ToList();
 
-                    var craftableItems = GetCraftableItems();
+                    var craftableItems = await GetCraftableItems();
 
                     var craftableWithMaterials = GetCraftableWithMaterials(allItems, craftableItems);
 
                     var profitabilityAnalysis = await PerformProfitabilityAnalysis(craftableWithMaterials);
+
+                    var filteredAnalysis = FilterAnalysis(profitabilityAnalysis, PluginConfiguration.FilterCriteria);
 
                     var pageNumber = 1;
                     if (!string.IsNullOrWhiteSpace(args))
@@ -87,7 +124,7 @@ namespace CraftingOptimizer
                         }
                     }
 
-                    DisplayResults(profitabilityAnalysis, pageNumber);
+                    DisplayResults(filteredAnalysis, pageNumber);
                 }
                 catch (Exception ex)
                 {
@@ -95,6 +132,65 @@ namespace CraftingOptimizer
                     ChatGui.PrintError("An unexpected error occurred. Please try again later.");
                 }
             });
+        }
+
+        private void OnRefreshCommand(string command, string args)
+        {
+            _itemCache.Clear();
+            _recipeCache.Clear();
+            _marketPricesCache.Clear();
+            ChatGui.Print("Craftable items cache and market prices cache have been refreshed.");
+        }
+
+        private void OnExportCommand(string command, string args)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var inventory = GetInventory();
+                    var retainerInventories = GetRetainerInventories();
+                    var saddlebagContents = GetSaddlebagContents();
+
+                    var allItems = inventory.Concat(retainerInventories).Concat(saddlebagContents).ToList();
+
+                    var craftableItems = await GetCraftableItems();
+
+                    var craftableWithMaterials = GetCraftableWithMaterials(allItems, craftableItems);
+
+                    var profitabilityAnalysis = await PerformProfitabilityAnalysis(craftableWithMaterials);
+
+                    var filteredAnalysis = FilterAnalysis(profitabilityAnalysis, PluginConfiguration.FilterCriteria);
+
+                    ExportToCSV(filteredAnalysis);
+
+                    ChatGui.Print("Crafting recommendations have been exported to a CSV file.");
+                }
+                catch (Exception ex)
+                {
+                    PluginLog.Error(ex, "An error occurred while exporting the crafting recommendations.");
+                    ChatGui.PrintError("An unexpected error occurred. Please try again later.");
+                }
+            });
+        }
+
+        private void OnHistoryCommand(string command, string args)
+        {
+            DisplayCraftingHistory();
+        }
+
+        private void OnFilterCommand(string command, string args)
+        {
+            if (string.IsNullOrWhiteSpace(args))
+            {
+                ChatGui.PrintError("Please provide filter criteria. Usage: /craftopt filter <criteria>");
+                return;
+            }
+
+            PluginConfiguration.FilterCriteria = args;
+            PluginConfiguration.Save();
+
+            ChatGui.Print($"Filter criteria set to: {args}");
         }
 
         private void OnNetworkMessage(IntPtr dataPtr, ushort opCode, uint sourceActorId, uint targetActorId, NetworkMessageDirection direction)
@@ -150,13 +246,8 @@ namespace CraftingOptimizer
             }).ToList();
         }
 
-        private List<CraftableItem> GetCraftableItems()
+        private async Task<List<CraftableItem>> GetCraftableItems()
         {
-            if (_craftableItemsCache.Count > 0)
-            {
-                return _craftableItemsCache.Values.ToList();
-            }
-
             var craftableItems = new List<CraftableItem>();
 
             var recipeSheet = GameData.GetExcelSheet<Recipe>();
@@ -164,49 +255,85 @@ namespace CraftingOptimizer
             {
                 foreach (var recipe in recipeSheet)
                 {
-                    var craftableItem = new CraftableItem
+                    if (_recipeCache.ContainsKey(recipe.RowId))
                     {
-                        ItemId = recipe.ItemResult.Value.RowId,
-                        ItemName = recipe.ItemResult.Value.Name,
-                        Materials = new List<Material>()
-                    };
-
-                    for (int i = 0; i < 10; i++)
-                    {
-                        var materialId = recipe.GetMaterial(i).Value?.RowId;
-                        var materialQuantity = recipe.AmountIngredient[i];
-
-                        if (materialId.HasValue && materialQuantity > 0)
-                        {
-                            craftableItem.Materials.Add(new Material
-                            {
-                                ItemId = materialId.Value,
-                                Quantity = materialQuantity
-                            });
-                        }
+                        var cachedRecipe = _recipeCache[recipe.RowId];
+                        craftableItems.Add(await CreateCraftableItem(cachedRecipe));
                     }
-
-                    _craftableItemsCache.TryAdd(craftableItem.ItemId, craftableItem);
-                    craftableItems.Add(craftableItem);
+                    else
+                    {
+                        _recipeCache.TryAdd(recipe.RowId, recipe);
+                        craftableItems.Add(await CreateCraftableItem(recipe));
+                    }
                 }
             }
 
             return craftableItems;
         }
 
-        private Dictionary<int, CraftableItem> GetCraftableWithMaterials(List<InventoryItem> availableItems, List<CraftableItem> craftableItems)
+        private async Task<CraftableItem> CreateCraftableItem(Recipe recipe)
         {
-            var materialCounts = new Dictionary<int, int>();
-            foreach (var item in availableItems)
+            var itemSheet = GameData.GetExcelSheet<Item>();
+            var resultItem = itemSheet?.GetRow(recipe.ItemResult.Value.RowId);
+
+            var craftableItem = new CraftableItem
             {
-                if (!materialCounts.ContainsKey(item.ItemId))
+                ItemId = recipe.ItemResult.Value.RowId,
+                ItemName = resultItem?.Name ?? string.Empty,
+                Materials = new List<Material>()
+            };
+
+            for (int i = 0; i < 10; i++)
+            {
+                var materialId = recipe.GetMaterial(i).Value?.RowId;
+                var materialQuantity = recipe.AmountIngredient[i];
+
+                if (materialId.HasValue && materialQuantity > 0)
                 {
-                    materialCounts[item.ItemId] = 0;
+                    var materialItem = await GetItemDetails(materialId.Value);
+                    craftableItem.Materials.Add(new Material
+                    {
+                        ItemId = materialId.Value,
+                        Quantity = materialQuantity,
+                        ItemName = materialItem?.Name ?? string.Empty
+                    });
                 }
-                materialCounts[item.ItemId] += item.Quantity;
             }
 
-            var craftableWithMaterials = new Dictionary<int, CraftableItem>();
+            return craftableItem;
+        }
+
+        private async Task<Item> GetItemDetails(uint itemId)
+        {
+            if (_itemCache.TryGetValue(itemId, out var item))
+            {
+                return item;
+            }
+
+            var itemSheet = GameData.GetExcelSheet<Item>();
+            item = itemSheet?.GetRow(itemId);
+
+            if (item != null)
+            {
+                _itemCache.TryAdd(itemId, item);
+            }
+
+            return item;
+        }
+
+        private Dictionary<uint, CraftableItem> GetCraftableWithMaterials(List<InventoryItem> availableItems, List<CraftableItem> craftableItems)
+        {
+            var materialCounts = new Dictionary<uint, int>();
+            foreach (var item in availableItems)
+            {
+                if (!materialCounts.ContainsKey((uint)item.ItemId))
+                {
+                    materialCounts[(uint)item.ItemId] = 0;
+                }
+                materialCounts[(uint)item.ItemId] += item.Quantity;
+            }
+
+            var craftableWithMaterials = new Dictionary<uint, CraftableItem>();
             foreach (var craftableItem in craftableItems)
             {
                 bool hasAllMaterials = true;
@@ -228,7 +355,7 @@ namespace CraftingOptimizer
             return craftableWithMaterials;
         }
 
-        private async Task<List<CraftingRecommendation>> PerformProfitabilityAnalysis(Dictionary<int, CraftableItem> craftableWithMaterials)
+        private async Task<List<CraftingRecommendation>> PerformProfitabilityAnalysis(Dictionary<uint, CraftableItem> craftableWithMaterials)
         {
             var profitabilityAnalysis = new List<CraftingRecommendation>();
 
@@ -251,7 +378,7 @@ namespace CraftingOptimizer
             return profitabilityAnalysis;
         }
 
-        private async Task<uint> GetMarketPrice(int itemId)
+        private async Task<uint> GetMarketPrice(uint itemId)
         {
             if (_marketPricesCache.TryGetValue(itemId, out var cachedPrice))
             {
@@ -277,9 +404,9 @@ namespace CraftingOptimizer
             }
         }
 
-        private Dictionary<int, List<int>> GetMaterialLocations(List<Material> materials)
+        private Dictionary<uint, List<int>> GetMaterialLocations(List<Material> materials)
         {
-            var materialLocations = new Dictionary<int, List<int>>();
+            var materialLocations = new Dictionary<uint, List<int>>();
 
             foreach (var material in materials)
             {
@@ -290,7 +417,7 @@ namespace CraftingOptimizer
             return materialLocations;
         }
 
-        private List<int> GetItemLocations(int itemId)
+        private List<int> GetItemLocations(uint itemId)
         {
             var locations = new List<int>();
 
@@ -302,13 +429,181 @@ namespace CraftingOptimizer
 
             foreach (var item in allItems)
             {
-                if (item.ItemId == itemId)
+                if ((uint)item.ItemId == itemId)
                 {
                     locations.Add(item.LocationId);
                 }
             }
 
             return locations;
+        }
+
+        private List<CraftingRecommendation> FilterAnalysis(List<CraftingRecommendation> analysis, string filterCriteria)
+        {
+            if (string.IsNullOrWhiteSpace(filterCriteria))
+            {
+                return analysis;
+            }
+
+            var filters = filterCriteria.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            var filteredAnalysis = analysis;
+
+            foreach (var filter in filters)
+            {
+                var filterParts = filter.Split(':', StringSplitOptions.RemoveEmptyEntries);
+                if (filterParts.Length != 2)
+                {
+                    continue;
+                }
+
+                var filterType = filterParts[0].Trim().ToLowerInvariant();
+                var filterValue = filterParts[1].Trim();
+
+                switch (filterType)
+                {
+                    case "itemlevel":
+                        if (int.TryParse(filterValue, out var itemLevel))
+                        {
+                            filteredAnalysis = filteredAnalysis.Where(r => GetItemLevel(r.ItemId) >= itemLevel).ToList();
+                        }
+                        break;
+                    case "craftingclass":
+                        filteredAnalysis = filteredAnalysis.Where(r => GetCraftingClass(r.ItemId).Equals(filterValue, StringComparison.OrdinalIgnoreCase)).ToList();
+                        break;
+                    // Add more filter cases as needed
+                }
+            }
+
+            return filteredAnalysis;
+        }
+
+        private int GetItemLevel(uint itemId)
+        {
+            var itemSheet = GameData.GetExcelSheet<Item>();
+            var item = itemSheet?.GetRow(itemId);
+            return item?.LevelItem.Row ?? 0;
+        }
+
+        private string GetCraftingClass(uint itemId)
+        {
+            var itemSheet = GameData.GetExcelSheet<Item>();
+            var item = itemSheet?.GetRow(itemId);
+            var classJobCategory = item?.ClassJobCategory.Value;
+            return classJobCategory?.Name ?? string.Empty;
+        }
+
+        private void ExportToCSV(List<CraftingRecommendation> recommendations)
+        {
+            var csvBuilder = new StringBuilder();
+            csvBuilder.AppendLine("Item Name,Profitability,Material Locations");
+
+            foreach (var recommendation in recommendations)
+            {
+                var materialLocations = string.Join("|", recommendation.MaterialLocations.SelectMany(x => x.Value));
+                var row = $"{recommendation.ItemName},{recommendation.Profitability},{materialLocations}";
+                csvBuilder.AppendLine(row);
+            }
+
+            var csvContent = csvBuilder.ToString();
+            var fileName = $"CraftingRecommendations_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
+            var filePath = Path.Combine(PluginInterface.GetPluginConfigDirectory(), fileName);
+
+            File.WriteAllText(filePath, csvContent);
+        }
+
+        private void DisplayCraftingHistory()
+        {
+            var chatMessage = new SeString();
+            chatMessage.Append(new TextPayload("Crafting History:\n"));
+
+            if (_craftingHistory.Count == 0)
+            {
+                chatMessage.Append(new TextPayload("No crafting history available."));
+            }
+            else
+            {
+                var groupedHistory = _craftingHistory.GroupBy(e => e.ItemId);
+
+                foreach (var group in groupedHistory)
+                {
+                    var itemName = GetItemName(group.Key);
+                    var totalProfit = group.Sum(e => e.Profit);
+                    var count = group.Count();
+
+                    var entryText = $"{itemName}: Total Profit: {totalProfit}, Count: {count}\n";
+                    chatMessage.Append(new TextPayload(entryText));
+                }
+            }
+
+            ChatGui.Print(chatMessage);
+        }
+
+        private string GetItemName(uint itemId)
+        {
+            var itemSheet = GameData.GetExcelSheet<Item>();
+            var item = itemSheet?.GetRow(itemId);
+            return item?.Name ?? string.Empty;
+        }
+
+        private void AddCraftingHistoryEntry(uint itemId, uint profit)
+        {
+            var entry = new CraftingHistoryEntry
+            {
+                ItemId = itemId,
+                Profit = profit,
+                Timestamp = DateTime.Now
+            };
+
+            _craftingHistory.Add(entry);
+
+            if (_craftingHistory.Count > PluginConfiguration.MaxCraftingHistoryEntries)
+            {
+                _craftingHistory.RemoveAt(0);
+            }
+        }
+
+        private void DisplayOptimalCraftingRotation(uint itemId)
+        {
+            var recipeSheet = GameData.GetExcelSheet<Recipe>();
+            var recipe = recipeSheet?.FirstOrDefault(r => r.ItemResult.Value.RowId == itemId);
+
+            if (recipe == null)
+            {
+                ChatGui.PrintError($"No recipe found for item {itemId}.");
+                return;
+            }
+
+            var chatMessage = new SeString();
+            chatMessage.Append(new TextPayload($"Optimal Crafting Rotation for {GetItemName(itemId)}:\n"));
+
+            var durability = recipe.Durability;
+            var progress = recipe.Progress;
+            var quality = recipe.Quality;
+
+            // Simulate the crafting rotation based on the recipe data
+            // You can use external libraries or implement your own logic to calculate the optimal rotation
+            // This example provides a basic rotation based on the recipe's durability, progress, and quality
+
+            while (durability > 0 && progress > 0)
+            {
+                if (durability > 20 && quality < recipe.MaxQuality)
+                {
+                    chatMessage.Append(new TextPayload("1. Basic Touch\n"));
+                    durability -= 10;
+                    quality += 100;
+                }
+                else
+                {
+                    chatMessage.Append(new TextPayload("2. Basic Synthesis\n"));
+                    durability -= 10;
+                    progress -= 120;
+                }
+            }
+
+            chatMessage.Append(new TextPayload("3. Careful Synthesis II\n"));
+            progress = 0;
+
+            ChatGui.Print(chatMessage);
         }
 
         private void DisplayResults(List<CraftingRecommendation> profitabilityAnalysis, int pageNumber)
@@ -332,7 +627,7 @@ namespace CraftingOptimizer
                 var profitability = recommendation.Profitability.ToString().PadLeft(10);
                 var materialLocations = string.Join(", ", recommendation.MaterialLocations.SelectMany(x => x.Value));
 
-                var profitColor = recommendation.Profitability >= 10000 ? "00ff00" : (recommendation.Profitability >= 5000 ? "ffff00" : "ff0000");
+                var profitColor = recommendation.Profitability >= PluginConfiguration.HighProfitThreshold ? "00ff00" : (recommendation.Profitability >= PluginConfiguration.MediumProfitThreshold ? "ffff00" : "ff0000");
                 var profitText = $"[{profitColor}]{profitability}[-]";
 
                 var rowText = $"{itemName} {profitText} {materialLocations,-20}\n";
@@ -345,6 +640,32 @@ namespace CraftingOptimizer
         }
     }
 
+    public class Configuration : IPluginConfiguration
+    {
+        public int Version { get; set; } = 1;
+
+        public int HighProfitThreshold { get; set; } = 10000;
+        public int MediumProfitThreshold { get; set; } = 5000;
+
+        public string FilterCriteria { get; set; } = string.Empty;
+
+        public int MaxCraftingHistoryEntries { get; set; } = 100;
+
+        // Add more configuration properties as needed
+
+        [JsonIgnore] private DalamudPluginInterface PluginInterface;
+
+        public void Initialize(DalamudPluginInterface pluginInterface)
+        {
+            PluginInterface = pluginInterface;
+        }
+
+        public void Save()
+        {
+            PluginInterface.SavePluginConfig(this);
+        }
+    }
+
     public class InventoryItem
     {
         public int ItemId { get; set; }
@@ -354,22 +675,30 @@ namespace CraftingOptimizer
 
     public class CraftableItem
     {
-        public int ItemId { get; set; }
+        public uint ItemId { get; set; }
         public string ItemName { get; set; }
         public List<Material> Materials { get; set; }
     }
 
     public class Material
     {
-        public int ItemId { get; set; }
+        public uint ItemId { get; set; }
         public int Quantity { get; set; }
+        public string ItemName { get; set; }
     }
 
     public class CraftingRecommendation
     {
-        public int ItemId { get; set; }
+        public uint ItemId { get; set; }
         public string ItemName { get; set; }
         public uint Profitability { get; set; }
-        public Dictionary<int, List<int>> MaterialLocations { get; set; }
+        public Dictionary<uint, List<int>> MaterialLocations { get; set; }
+    }
+
+    public class CraftingHistoryEntry
+    {
+        public uint ItemId { get; set; }
+        public uint Profit { get; set; }
+        public DateTime Timestamp { get; set; }
     }
 }
